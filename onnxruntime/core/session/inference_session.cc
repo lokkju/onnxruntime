@@ -70,6 +70,7 @@
 #include "core/providers/dml/DmlExecutionProvider/src/ExecutionProvider.h"
 #include "core/optimizer/stft_decomposition.h"
 #endif
+#include "core/optimizer/lstm_decomposition.h"
 #include "core/session/environment.h"
 #include "core/session/IOBinding.h"
 #include "core/session/inference_session_utils.h"
@@ -2338,6 +2339,16 @@ common::Status InferenceSession::Initialize() {
         }
       }
 #endif
+
+      // Register LSTM decomposition for WebGPU EP.
+      // LSTM is not natively supported by WebGPU, but all the primitive ops it
+      // decomposes into (MatMul, Split, Sigmoid, Tanh, Mul, Add) are supported.
+      if (execution_providers_.Get(kWebGpuExecutionProvider)) {
+        const InlinedHashSet<std::string_view> webgpu_ep = {onnxruntime::kWebGpuExecutionProvider};
+        auto lstm_decomposition = std::make_unique<LSTMDecomposition>(webgpu_ep);
+        ORT_RETURN_IF_ERROR_SESSIONID_(graph_transformer_mgr_.Register(
+            std::move(lstm_decomposition), onnxruntime::TransformerLevel::Level1));
+      }
 
       // apply any transformations to the main graph and any subgraphs
       ORT_RETURN_IF_ERROR_SESSIONID_(TransformGraph(graph, saving_ort_format));
