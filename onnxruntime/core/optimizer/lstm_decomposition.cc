@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <functional>
+
 #include "core/optimizer/lstm_decomposition.h"
 #include "core/optimizer/initializer.h"
 #include "core/optimizer/utils.h"
@@ -31,21 +33,21 @@ NodeArg* AddInt64Initializer(Graph& graph, const char* name,
   return &graph_utils::AddInitializerWithOrtValue(graph, proto);
 }
 
-// Add a node with one output, return the output NodeArg.
-NodeArg* AddNode1(Graph& graph, const char* op_type,
-                  gsl::span<NodeArg*> inputs,
-                  const std::string& ep_type,
-                  std::function<void(Node&)> configure = nullptr) {
+// Add a node with one output, return the Node pointer and output NodeArg.
+std::pair<Node*, NodeArg*> AddNode1(Graph& graph, const char* op_type,
+                                    gsl::span<NodeArg*> inputs,
+                                    const std::string& ep_type,
+                                    std::function<void(Node&)> configure = nullptr) {
   auto out_name = graph.GenerateNodeArgName(op_type);
   auto* out_arg = &graph.GetOrCreateNodeArg(out_name, nullptr);
   Node& n = graph.AddNode(graph.GenerateNodeName(op_type), op_type, "", inputs, {out_arg});
   n.SetExecutionProviderType(ep_type);
   if (configure) configure(n);
-  return out_arg;
+  return {&n, out_arg};
 }
 
-// Add a node with N outputs, return the Node and output NodeArgs.
-std::pair<Node&, std::vector<NodeArg*>> AddNodeN(Graph& graph, const char* op_type,
+// Add a node with N outputs, return the Node pointer and output NodeArgs.
+std::pair<Node*, std::vector<NodeArg*>> AddNodeN(Graph& graph, const char* op_type,
                                                   gsl::span<NodeArg*> inputs,
                                                   int num_outputs,
                                                   const std::string& ep_type) {
@@ -57,7 +59,7 @@ std::pair<Node&, std::vector<NodeArg*>> AddNodeN(Graph& graph, const char* op_ty
   }
   Node& n = graph.AddNode(graph.GenerateNodeName(op_type), op_type, "", inputs, outs);
   n.SetExecutionProviderType(ep_type);
-  return {n, std::move(outs)};
+  return {&n, std::move(outs)};
 }
 
 }  // namespace
@@ -129,45 +131,45 @@ Status LSTMDecomposition::ApplyImpl(Graph& graph, bool& modified, int graph_leve
 
     // Squeeze away num_directions dim (axis 0).
     NodeArg* sq_x_in[] = {X, axes_0};
-    auto* Xt = AddNode1(graph, "Squeeze", sq_x_in, ep);          // [batch, input_size]
+    auto* Xt = AddNode1(graph, "Squeeze", sq_x_in, ep).second;          // [batch, input_size]
 
     NodeArg* sq_w_in[] = {W, axes_0};
-    auto* Ws = AddNode1(graph, "Squeeze", sq_w_in, ep);          // [4H, input_size]
+    auto* Ws = AddNode1(graph, "Squeeze", sq_w_in, ep).second;          // [4H, input_size]
 
     NodeArg* sq_r_in[] = {R, axes_0};
-    auto* Rs = AddNode1(graph, "Squeeze", sq_r_in, ep);          // [4H, H]
+    auto* Rs = AddNode1(graph, "Squeeze", sq_r_in, ep).second;          // [4H, H]
 
     NodeArg* sq_h_in[] = {init_h_def, axes_0};
-    auto* Ht_prev = AddNode1(graph, "Squeeze", sq_h_in, ep);     // [batch, H]
+    auto* Ht_prev = AddNode1(graph, "Squeeze", sq_h_in, ep).second;     // [batch, H]
 
     NodeArg* sq_c_in[] = {init_c_def, axes_0};
-    auto* Ct_prev = AddNode1(graph, "Squeeze", sq_c_in, ep);     // [batch, H]
+    auto* Ct_prev = AddNode1(graph, "Squeeze", sq_c_in, ep).second;     // [batch, H]
 
     // Transpose W and R for MatMul: [4H, N] -> [N, 4H]
     NodeArg* tw_in[] = {Ws};
     auto* WT = AddNode1(graph, "Transpose", tw_in, ep, [](Node& n) {
       n.AddAttribute("perm", std::vector<int64_t>{1, 0});
-    });
+    }).second;
 
     NodeArg* tr_in[] = {Rs};
     auto* RT = AddNode1(graph, "Transpose", tr_in, ep, [](Node& n) {
       n.AddAttribute("perm", std::vector<int64_t>{1, 0});
-    });
+    }).second;
 
     // gates = Xt @ W^T + Ht_prev @ R^T
     NodeArg* mm1_in[] = {Xt, WT};
-    auto* xW = AddNode1(graph, "MatMul", mm1_in, ep);            // [batch, 4H]
+    auto* xW = AddNode1(graph, "MatMul", mm1_in, ep).second;            // [batch, 4H]
 
     NodeArg* mm2_in[] = {Ht_prev, RT};
-    auto* hR = AddNode1(graph, "MatMul", mm2_in, ep);            // [batch, 4H]
+    auto* hR = AddNode1(graph, "MatMul", mm2_in, ep).second;            // [batch, 4H]
 
     NodeArg* add_g_in[] = {xW, hR};
-    auto* gates = AddNode1(graph, "Add", add_g_in, ep);          // [batch, 4H]
+    auto* gates = AddNode1(graph, "Add", add_g_in, ep).second;          // [batch, 4H]
 
     // Add bias: B = [1, 8H] -> squeeze -> [8H] -> split Wb[4H]+Rb[4H] -> add -> [4H]
     if (B) {
       NodeArg* sq_b_in[] = {B, axes_0};
-      auto* Bs = AddNode1(graph, "Squeeze", sq_b_in, ep);
+      auto* Bs = AddNode1(graph, "Squeeze", sq_b_in, ep).second;
 
       int64_t four_h = 4 * hidden_size;
       const int64_t sp_sizes[] = {four_h, four_h};
@@ -175,14 +177,14 @@ Status LSTMDecomposition::ApplyImpl(Graph& graph, bool& modified, int graph_leve
       auto* sp_init = AddInt64Initializer(graph, "lstm_bsplit", sp_shape, sp_sizes);
 
       NodeArg* spb_in[] = {Bs, sp_init};
-      auto& [sp_node, sp_outs] = AddNodeN(graph, "Split", spb_in, 2, ep);
-      sp_node.AddAttribute("axis", static_cast<int64_t>(0));
+      auto [sp_node, sp_outs] = AddNodeN(graph, "Split", spb_in, 2, ep);
+      sp_node->AddAttribute("axis", static_cast<int64_t>(0));
 
       NodeArg* ab_in[] = {sp_outs[0], sp_outs[1]};
-      auto* bias = AddNode1(graph, "Add", ab_in, ep);            // [4H]
+      auto* bias = AddNode1(graph, "Add", ab_in, ep).second;            // [4H]
 
       NodeArg* abg_in[] = {gates, bias};
-      gates = AddNode1(graph, "Add", abg_in, ep);                // [batch, 4H]
+      gates = AddNode1(graph, "Add", abg_in, ep).second;                // [batch, 4H]
     }
 
     // Split gates into 4 x [batch, H]: i, o, f, c (IOFC)
@@ -192,8 +194,8 @@ Status LSTMDecomposition::ApplyImpl(Graph& graph, bool& modified, int graph_leve
     auto* gs_init = AddInt64Initializer(graph, "lstm_gsplit", gs_shape, gs_sizes);
 
     NodeArg* sg_in[] = {gates, gs_init};
-    auto& [sg_node, gparts] = AddNodeN(graph, "Split", sg_in, 4, ep);
-    sg_node.AddAttribute("axis", static_cast<int64_t>(1));
+    auto [sg_node, gparts] = AddNodeN(graph, "Split", sg_in, 4, ep);
+    sg_node->AddAttribute("axis", static_cast<int64_t>(1));
 
     auto* i_gate = gparts[0];
     auto* o_gate = gparts[1];
@@ -202,82 +204,67 @@ Status LSTMDecomposition::ApplyImpl(Graph& graph, bool& modified, int graph_leve
 
     // Gate activations
     NodeArg* si_in[] = {i_gate};
-    auto* it = AddNode1(graph, "Sigmoid", si_in, ep);
+    auto* it = AddNode1(graph, "Sigmoid", si_in, ep).second;
     NodeArg* so_in[] = {o_gate};
-    auto* ot = AddNode1(graph, "Sigmoid", so_in, ep);
+    auto* ot = AddNode1(graph, "Sigmoid", so_in, ep).second;
     NodeArg* sf_in[] = {f_gate};
-    auto* ft = AddNode1(graph, "Sigmoid", sf_in, ep);
+    auto* ft = AddNode1(graph, "Sigmoid", sf_in, ep).second;
     NodeArg* tc_in[] = {c_gate};
-    auto* ct_act = AddNode1(graph, "Tanh", tc_in, ep);
+    auto* ct_act = AddNode1(graph, "Tanh", tc_in, ep).second;
 
     // Ct = ft * Ct_prev + it * ct
     NodeArg* mf_in[] = {ft, Ct_prev};
-    auto* ft_Cp = AddNode1(graph, "Mul", mf_in, ep);
+    auto* ft_Cp = AddNode1(graph, "Mul", mf_in, ep).second;
     NodeArg* mi_in[] = {it, ct_act};
-    auto* it_ct = AddNode1(graph, "Mul", mi_in, ep);
+    auto* it_ct = AddNode1(graph, "Mul", mi_in, ep).second;
     NodeArg* ac_in[] = {ft_Cp, it_ct};
-    auto* Ct_new = AddNode1(graph, "Add", ac_in, ep);
+    auto* Ct_new = AddNode1(graph, "Add", ac_in, ep).second;
 
     // Ht = ot * Tanh(Ct)
     NodeArg* tC_in[] = {Ct_new};
-    auto* tanh_Ct = AddNode1(graph, "Tanh", tC_in, ep);
+    auto* tanh_Ct = AddNode1(graph, "Tanh", tC_in, ep).second;
     NodeArg* mh_in[] = {ot, tanh_Ct};
-    auto* Ht_new = AddNode1(graph, "Mul", mh_in, ep);
+    auto* Ht_new = AddNode1(graph, "Mul", mh_in, ep).second;
 
-    // Unsqueeze to restore num_directions dim
+    // Unsqueeze to restore num_directions dim.
+    // Track producer nodes for direct output rewiring.
     // Y_h: [batch, H] -> [1, batch, H]
     NodeArg* uh_in[] = {Ht_new, axes_0};
-    auto* Y_h = AddNode1(graph, "Unsqueeze", uh_in, ep);
+    auto [y_h_producer, Y_h] = AddNode1(graph, "Unsqueeze", uh_in, ep);
 
     // Y_c: [batch, H] -> [1, batch, H]
     NodeArg* uc_in[] = {Ct_new, axes_0};
-    auto* Y_c = AddNode1(graph, "Unsqueeze", uc_in, ep);
+    auto [y_c_producer, Y_c] = AddNode1(graph, "Unsqueeze", uc_in, ep);
 
     // Y: [1, batch, H] -> [1, 1, batch, H]
     NodeArg* uy_in[] = {Y_h, axes_0};
-    auto* Y = AddNode1(graph, "Unsqueeze", uy_in, ep);
+    auto [y_producer, Y] = AddNode1(graph, "Unsqueeze", uy_in, ep);
 
-    // --- Rewire outputs following the STFT decomposition pattern ---
-    // We need to connect the new subgraph outputs to the LSTM's downstream consumers.
-    //
-    // The approach: for each existing LSTM output, find the producer node of the
-    // replacement NodeArg and set its output def to the original LSTM output def.
-    // Then re-add output edges.
+    // --- Rewire outputs ---
+    // Replace each LSTM output with the corresponding new producer's output.
+    // This follows the STFT decomposition pattern: assign the original LSTM
+    // output defs to the new producer nodes, then re-add output edges.
 
     auto input_edges = graph_utils::GraphEdge::GetNodeInputEdges(lstm);
     auto output_edges = graph_utils::GraphEdge::GetNodeOutputEdges(lstm);
 
-    NodeArg* replacements[] = {Y, Y_h, Y_c};
     auto& lstm_outs = lstm.MutableOutputDefs();
+
+    // Map output index -> producer node
+    Node* producers[] = {y_producer, y_h_producer, y_c_producer};
 
     for (size_t oi = 0; oi < lstm_outs.size() && oi < 3; ++oi) {
       if (!lstm_outs[oi] || !lstm_outs[oi]->Exists()) continue;
-
-      // Find the node that produces replacements[oi] and swap in the original output def
-      for (auto& gn : graph.Nodes()) {
-        auto& odefs = gn.MutableOutputDefs();
-        for (size_t di = 0; di < odefs.size(); ++di) {
-          if (odefs[di] == replacements[oi]) {
-            odefs[di] = lstm_outs[oi];
-            goto rewired;
-          }
-        }
-      }
-    rewired:;
+      // Replace the producer node's output def with the original LSTM output def.
+      producers[oi]->MutableOutputDefs()[0] = lstm_outs[oi];
     }
 
-    // Re-add output edges from the new producer nodes to downstream consumers.
+    // Re-add output edges from new producer nodes to downstream consumers.
     for (const auto& edge : output_edges) {
-      // Find which node now holds the original output def
-      for (auto& gn : graph.Nodes()) {
-        for (size_t di = 0; di < gn.MutableOutputDefs().size(); ++di) {
-          if (gn.MutableOutputDefs()[di] == lstm_outs[edge.src_arg_index]) {
-            graph.AddEdge(gn.Index(), edge.dst_node, static_cast<int>(di), edge.dst_arg_index);
-            goto edge_done;
-          }
-        }
+      auto src_idx = static_cast<size_t>(edge.src_arg_index);
+      if (src_idx < 3 && producers[src_idx]) {
+        graph.AddEdge(producers[src_idx]->Index(), edge.dst_node, 0, edge.dst_arg_index);
       }
-    edge_done:;
     }
 
     // Remove original LSTM node
