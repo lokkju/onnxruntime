@@ -100,11 +100,13 @@ Status LSTMDecomposition::ApplyImpl(Graph& graph, bool& modified, int graph_leve
     // No peephole.
     if (lstm.InputDefs().size() > 7 && lstm.InputDefs()[7]->Exists()) continue;
 
-    // Only seq_len=1.
+    // Only seq_len=1 (skip if statically known to be >1; allow if unknown).
     auto* X_def = lstm.MutableInputDefs()[0];
-    if (!X_def || !X_def->Shape() || X_def->Shape()->dim_size() < 1) continue;
-    auto& seq_dim = X_def->Shape()->dim(0);
-    if (!seq_dim.has_dim_value() || seq_dim.dim_value() != 1) continue;
+    if (!X_def) continue;
+    if (X_def->Shape() && X_def->Shape()->dim_size() >= 1) {
+      auto& seq_dim = X_def->Shape()->dim(0);
+      if (seq_dim.has_dim_value() && seq_dim.dim_value() != 1) continue;
+    }
 
     int64_t hidden_size = 0;
     if (attrs.count("hidden_size")) hidden_size = attrs.at("hidden_size").i();
