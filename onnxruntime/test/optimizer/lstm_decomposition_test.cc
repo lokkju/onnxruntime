@@ -4,22 +4,15 @@
 #include "core/graph/graph.h"
 #include "core/optimizer/lstm_decomposition.h"
 #include "test/optimizer/graph_transform_test_fixture.h"
+#include "test/unittest_util/framework_test_utils.h"
 #include "test/unittest_util/graph_transform_test_builder.h"
+#include "test/util/include/asserts.h"
 #include "gtest/gtest.h"
 
 namespace onnxruntime {
 namespace test {
 
 namespace {
-
-// Count nodes of a given op type in a graph.
-int CountOpsInGraph(const Graph& graph, const std::string& op_type) {
-  int count = 0;
-  for (const auto& node : graph.Nodes()) {
-    if (node.OpType() == op_type) ++count;
-  }
-  return count;
-}
 
 // Build a minimal LSTM graph.
 //   x_shape: shape for X input. std::nullopt => no shape info at all.
@@ -89,15 +82,15 @@ TEST_F(GraphTransformationTests, LSTMDecomposition_Forward_SeqLen1) {
   constexpr int64_t seq_len = 1, batch_size = 1, input_size = 8, hidden_size = 4;
 
   auto pre_graph_checker = [](Graph& graph) -> Status {
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "LSTM") == 1);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["LSTM"] == 1);
     return Status::OK();
   };
 
   auto post_graph_checker = [](Graph& graph) -> Status {
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "LSTM") == 0);
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "MatMul") > 0);
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "Sigmoid") > 0);
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "Tanh") > 0);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["LSTM"] == 0);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["MatMul"] > 0);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["Sigmoid"] > 0);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["Tanh"] > 0);
     return Status::OK();
   };
 
@@ -121,13 +114,13 @@ TEST_F(GraphTransformationTests, LSTMDecomposition_Forward_DynamicSeqLen) {
   constexpr int64_t input_size = 8, hidden_size = 4;
 
   auto pre_graph_checker = [](Graph& graph) -> Status {
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "LSTM") == 1);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["LSTM"] == 1);
     return Status::OK();
   };
 
   auto post_graph_checker = [](Graph& graph) -> Status {
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "LSTM") == 0);
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "MatMul") > 0);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["LSTM"] == 0);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["MatMul"] > 0);
     return Status::OK();
   };
 
@@ -150,12 +143,12 @@ TEST_F(GraphTransformationTests, LSTMDecomposition_Bidirectional_Skipped) {
   constexpr int64_t seq_len = 1, batch_size = 1, input_size = 8, hidden_size = 4;
 
   auto pre_graph_checker = [](Graph& graph) -> Status {
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "LSTM") == 1);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["LSTM"] == 1);
     return Status::OK();
   };
 
   auto post_graph_checker = [](Graph& graph) -> Status {
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "LSTM") == 1);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["LSTM"] == 1);
     return Status::OK();
   };
 
@@ -178,12 +171,12 @@ TEST_F(GraphTransformationTests, LSTMDecomposition_SeqLenGt1_Skipped) {
   constexpr int64_t seq_len = 4, batch_size = 1, input_size = 8, hidden_size = 4;
 
   auto pre_graph_checker = [](Graph& graph) -> Status {
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "LSTM") == 1);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["LSTM"] == 1);
     return Status::OK();
   };
 
   auto post_graph_checker = [](Graph& graph) -> Status {
-    TEST_RETURN_IF_NOT(CountOpsInGraph(graph, "LSTM") == 1);
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["LSTM"] == 1);
     return Status::OK();
   };
 

@@ -228,51 +228,67 @@ Status LSTMDecomposition::ApplyImpl(Graph& graph, bool& modified, int graph_leve
     NodeArg* mh_in[] = {ot, tanh_Ct};
     auto* Ht_new = AddNode1(graph, "Mul", mh_in, ep).second;
 
-    // Unsqueeze to restore num_directions dim.
-    // Track producer nodes for direct output rewiring.
-    // Y_h: [batch, H] -> [1, batch, H]
-    NodeArg* uh_in[] = {Ht_new, axes_0};
-    auto [y_h_producer, Y_h] = AddNode1(graph, "Unsqueeze", uh_in, ep);
-
-    // Y_c: [batch, H] -> [1, batch, H]
-    NodeArg* uc_in[] = {Ct_new, axes_0};
-    auto [y_c_producer, Y_c] = AddNode1(graph, "Unsqueeze", uc_in, ep);
-
-    // Y: [1, batch, H] -> [1, 1, batch, H]
-    NodeArg* uy_in[] = {Y_h, axes_0};
-    auto [y_producer, Y] = AddNode1(graph, "Unsqueeze", uy_in, ep);
-
     // --- Rewire outputs ---
-    // Replace each LSTM output with the corresponding new producer's output.
-    // This follows the STFT decomposition pattern: assign the original LSTM
-    // output defs to the new producer nodes, then re-add output edges.
-
+    // Collect edges and LSTM output defs before modifying the graph.
     auto input_edges = graph_utils::GraphEdge::GetNodeInputEdges(lstm);
     auto output_edges = graph_utils::GraphEdge::GetNodeOutputEdges(lstm);
-
     auto& lstm_outs = lstm.MutableOutputDefs();
 
-    // Map output index -> producer node
-    Node* producers[] = {y_producer, y_h_producer, y_c_producer};
+    // Get the original LSTM output NodeArgs (Y, Y_h, Y_c).
+    NodeArg* orig_Y = (lstm_outs.size() > 0 && lstm_outs[0]->Exists()) ? lstm_outs[0] : nullptr;
+    NodeArg* orig_Y_h = (lstm_outs.size() > 1 && lstm_outs[1]->Exists()) ? lstm_outs[1] : nullptr;
+    NodeArg* orig_Y_c = (lstm_outs.size() > 2 && lstm_outs[2]->Exists()) ? lstm_outs[2] : nullptr;
 
-    for (size_t oi = 0; oi < lstm_outs.size() && oi < 3; ++oi) {
-      if (!lstm_outs[oi] || !lstm_outs[oi]->Exists()) continue;
-      // Replace the producer node's output def with the original LSTM output def.
-      producers[oi]->MutableOutputDefs()[0] = lstm_outs[oi];
+    // Remove the original LSTM node first.
+    graph_utils::GraphEdge::RemoveGraphEdges(graph, input_edges);
+    graph_utils::GraphEdge::RemoveGraphEdges(graph, output_edges);
+    graph.RemoveNode(lstm.Index());
+
+    // Now create Unsqueeze nodes that output directly to the original LSTM output NodeArgs.
+    // This avoids creating intermediate NodeArgs that become orphaned.
+
+    // Helper: add a node whose output is an existing NodeArg.
+    auto AddNodeWithOutput = [&](const char* op_type, gsl::span<NodeArg*> inputs,
+                                 NodeArg* output_arg) -> Node& {
+      Node& n = graph.AddNode(graph.GenerateNodeName(op_type), op_type, "",
+                               inputs, {output_arg});
+      n.SetExecutionProviderType(ep);
+      return n;
+    };
+
+    // Y_h: [batch, H] -> [1, batch, H]
+    Node* y_h_producer = nullptr;
+    if (orig_Y_h) {
+      NodeArg* uh_in[] = {Ht_new, axes_0};
+      y_h_producer = &AddNodeWithOutput("Unsqueeze", uh_in, orig_Y_h);
+    }
+
+    // Y_c: [batch, H] -> [1, batch, H]
+    Node* y_c_producer = nullptr;
+    if (orig_Y_c) {
+      NodeArg* uc_in[] = {Ct_new, axes_0};
+      y_c_producer = &AddNodeWithOutput("Unsqueeze", uc_in, orig_Y_c);
+    }
+
+    // Y: [batch, H] -> [1, batch, H] -> [1, 1, batch, H]
+    Node* y_producer = nullptr;
+    if (orig_Y) {
+      // First unsqueeze: [batch, H] -> [1, batch, H] (intermediate)
+      NodeArg* uy1_in[] = {Ht_new, axes_0};
+      auto* y_intermediate = AddNode1(graph, "Unsqueeze", uy1_in, ep).second;
+      // Second unsqueeze: [1, batch, H] -> [1, 1, batch, H] -> orig_Y
+      NodeArg* uy2_in[] = {y_intermediate, axes_0};
+      y_producer = &AddNodeWithOutput("Unsqueeze", uy2_in, orig_Y);
     }
 
     // Re-add output edges from new producer nodes to downstream consumers.
+    Node* producers[] = {y_producer, y_h_producer, y_c_producer};
     for (const auto& edge : output_edges) {
       auto src_idx = static_cast<size_t>(edge.src_arg_index);
       if (src_idx < 3 && producers[src_idx]) {
         graph.AddEdge(producers[src_idx]->Index(), edge.dst_node, 0, edge.dst_arg_index);
       }
     }
-
-    // Remove original LSTM node
-    graph_utils::GraphEdge::RemoveGraphEdges(graph, input_edges);
-    graph_utils::GraphEdge::RemoveGraphEdges(graph, output_edges);
-    graph.RemoveNode(lstm.Index());
 
     modified = true;
   }
